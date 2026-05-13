@@ -223,7 +223,7 @@ def mla_decode_fwd(
 
         MAYBE_FINAL_OUT = True
 
-        if nhead in [8, 16] and max_seqlen_q == 1:
+        if max_seqlen_q == 1 and (nhead in [8, 16] or return_lse):
             MAYBE_FINAL_OUT = False
 
         logits = (
@@ -275,7 +275,7 @@ def mla_decode_fwd(
             logits,
             attn_lse,
             o,
-            final_lse,
+            None,  # DCP FIX: stage1 不传 final_lse，由 stage2 输出
             q_scale,
             kv_scale,
         )
@@ -511,7 +511,7 @@ def mla_decode_fwd(
                 logits,
                 attn_lse,
                 o,
-                final_lse,
+                None,  # DCP FIX: stage1 不传 final_lse，由 mla_reduce_v1 输出
                 q_scale,
                 kv_scale,
             )
