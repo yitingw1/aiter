@@ -531,17 +531,16 @@ class GroupCoordinator:
         use_custom: bool = True,
         dim: int = 0,
     ):
-        # return outplace_reduce_scatter(input_, group_name=self.unique_name, dim=dim)
         world_size = self.world_size
         assert world_size > 1, "error! world_size = 1"
-        assert (
-            input_.numel() % world_size == 0
-        ), "input shape error, input.numel() % world_size should equals to 0"
-        if input_.shape[0] % world_size == 0:
-            out_dim0 = input_.shape[0] // world_size
-            out_shape = (out_dim0,) + input_.shape[1:]
-        else:
-            out_shape = (input_.numel() // world_size,)
+        if dim < 0:
+            dim += input_.dim()
+        assert input_.shape[dim] % world_size == 0, (
+            f"input.shape[{dim}]={input_.shape[dim]} not divisible by "
+            f"world_size={world_size}"
+        )
+        out_shape = list(input_.shape)
+        out_shape[dim] = input_.shape[dim] // world_size
 
         output_ = torch.empty(out_shape, dtype=input_.dtype, device=input_.device)
         if use_custom:
@@ -553,6 +552,13 @@ class GroupCoordinator:
                 output_, input_, group=self.device_group
             )
         return output_
+
+    def reduce_scatter(
+        self, input_: torch.Tensor, dim: int = 0
+    ) -> torch.Tensor:
+        if self.world_size == 1:
+            return input_
+        return self.reduce_scatter_tensor(input_, dim=dim)
 
     def all_gather(
         self,
@@ -1069,6 +1075,14 @@ def get_ep_group() -> GroupCoordinator:
     return _EP
 
 
+_DCP: Optional[GroupCoordinator] = None
+
+
+def get_dcp_group() -> GroupCoordinator:
+    assert _DCP is not None, "decode context model parallel group is not initialized"
+    return _DCP
+
+
 def has_custom_group() -> bool:
     """Return whether any custom group is initialized."""
     return bool(_CUSTOM)
@@ -1158,12 +1172,14 @@ def graph_capture():
     in order to explicitly distinguish the kernels to capture
     from other kernels possibly launched on background in the default stream.
     """
-    if _CUSTOM:
+    if _CUSTOM or (_DCP is not None and _DCP.world_size > 1):
         from contextlib import ExitStack
 
         with ExitStack() as stack:
             context = stack.enter_context(get_tp_group().graph_capture())
             stack.enter_context(get_pp_group().graph_capture(context))
+            if _DCP is not None and _DCP.world_size > 1:
+                stack.enter_context(_DCP.graph_capture(context))
             for group in _CUSTOM.values():
                 stack.enter_context(group.graph_capture(context))
             yield context
@@ -1245,7 +1261,7 @@ def init_distributed_environment(
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
-    # decode_context_model_parallel_size: Optional[int] = 1,
+    decode_context_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     data_parallel_size: int = 1,
     custom_group_config: Optional[Dict[str, List]] = None,
@@ -1326,22 +1342,19 @@ def initialize_model_parallel(
         group_name="tp",
     )
 
-    # # Build the DCP model-parallel groups.
-    # global _DCP
-    # assert _DCP is None, "decode context model parallel group is already initialized"
-    # # Note(hc): In the current implementation of decode context parallel,
-    # # dcp_size must not exceed tp_size, because the world size does not
-    # # change by DCP, it simply reuses the GPUs of TP group, and split one
-    # # TP group into tp_size//dcp_size DCP groups.
-    # group_ranks = all_ranks.reshape(-1, decode_context_model_parallel_size).unbind(0)
-    # group_ranks = [x.tolist() for x in group_ranks]
-    # _DCP = init_model_parallel_group(
-    #     group_ranks,
-    #     get_world_group().local_rank,
-    #     backend,
-    #     use_message_queue_broadcaster=True,
-    #     group_name="dcp",
-    # )
+    # Build the DCP model-parallel groups.
+    global _DCP
+    assert _DCP is None, "decode context model parallel group is already initialized"
+    if decode_context_model_parallel_size > 1:
+        group_ranks = all_ranks.reshape(-1, decode_context_model_parallel_size).unbind(0)
+        group_ranks = [x.tolist() for x in group_ranks]
+        _DCP = init_model_parallel_group(
+            group_ranks,
+            get_world_group().local_rank,
+            backend,
+            use_device_communicator=need_std_comm,
+            group_name="dcp",
+        )
 
     # Build the pipeline model-parallel groups.
     global _PP
@@ -1453,6 +1466,7 @@ def initialize_model_parallel(
 def ensure_model_parallel_initialized(
     tensor_model_parallel_size: int,
     pipeline_model_parallel_size: int,
+    decode_context_model_parallel_size: int = 1,
     backend: Optional[str] = None,
     data_parallel_size: int = 1,
     custom_group_config: Optional[Dict[str, List]] = None,
@@ -1466,6 +1480,7 @@ def ensure_model_parallel_initialized(
         initialize_model_parallel(
             tensor_model_parallel_size,
             pipeline_model_parallel_size,
+            decode_context_model_parallel_size,
             backend,
             data_parallel_size,
             custom_group_config=custom_group_config,
@@ -1549,6 +1564,11 @@ def destroy_model_parallel():
     if _EP:
         _EP.destroy()
     _EP = None
+
+    global _DCP
+    if _DCP:
+        _DCP.destroy()
+    _DCP = None
 
     global _CUSTOM
     for group in _CUSTOM.values():
