@@ -287,7 +287,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         pre-quantization bf16/fp16 normed output.
 
         When ``emit_bf16=False`` returns ``(fp8, residual_out, scale)``.
-        When ``emit_bf16=True`` returns ``(fp8, residual_out, scale, bf16)`` —
+        When ``emit_bf16=True`` returns ``(fp8, residual_out, scale, bf16)`` --
         used by GDN-style layers that have both an FP8 projection and a bf16
         gating projection consuming the same normed activation, so they can
         skip the separate per-group quant kernel entirely (see Qwen3.5).
@@ -390,19 +390,29 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self, input_: torch.Tensor, output_: torch.Tensor, dim: int = -1
     ):
         world_size = self.world_size
+        if dim < 0:
+            dim += input_.dim()
         ca_comm = self.ca_comm
         if (
             ca_comm is not None
             and not ca_comm.disabled
             and ca_comm.should_custom_ar(input_)
         ):
-            ca_comm.custom_reduce_scatter(input_, output_)
+            if dim == 0:
+                ca_comm.custom_reduce_scatter(input_, output_)
+            else:
+                input_tensor = input_.movedim(dim, 0).contiguous()
+                tmp = torch.empty(
+                    input_tensor.shape[0] // world_size,
+                    *input_tensor.shape[1:],
+                    dtype=input_tensor.dtype,
+                    device=input_tensor.device,
+                )
+                ca_comm.custom_reduce_scatter(input_tensor, tmp)
+                output_.copy_(tmp.movedim(0, dim))
         else:
             pynccl_comm = self.pynccl_comm
             assert pynccl_comm is not None
-            if dim < 0:
-                # Convert negative dim to positive.
-                dim += input_.dim()
 
             if dim == 0:
                 input_tensor = input_.contiguous()
